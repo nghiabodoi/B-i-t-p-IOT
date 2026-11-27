@@ -1,0 +1,229 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ====== SUA CAC THONG SO NAY ======
+const char* WIFI_SSID = "Hehe";
+const char* WIFI_PASS = "12346789";
+// IP cua may chay app.py (xem bang ipconfig, dong IPv4 cua WiFi)
+const char* SERVER_URL = "http://10.242.3.169:5000/upload";
+// ==================================
+
+#define PIR_PIN        13     // PIR OUT
+#define LED_PIN        14     // LED duy nhat (qua tro 220 ohm xuong GND)
+#define BUZZER_PIN     15     // coi buzzer
+#define BUZZER_ACTIVE_HIGH 1  // 1 = coi keu khi chan o muc cao; 0 = kich hoat muc thap
+#define FLASH_PIN       4     // den flash tren board ESP32-CAM
+#define USE_FLASH       0     // 1 = bat den flash khi chup
+
+#define COOLDOWN_MS    4000   // khoang nghi giua 2 lan chup
+#define PIR_WARMUP_MS 30000   // PIR can on dinh sau khi cap dien
+#define RESULT_SHOW_MS 2000   // thoi gian LED sang khi hop le
+
+// Chan camera cho board AI Thinker ESP32-CAM
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+unsigned long lastShot = 0;
+
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_VGA;   // 640x480
+    config.jpeg_quality = 10;            // so nho = chat luong cao
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init that bai, loi 0x%x\n", err);
+    return false;
+  }
+  return true;
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);          // tat che do ngu WiFi, on dinh hon
+  WiFi.setAutoReconnect(true);   // tu ket noi lai khi mat song
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Dang ket noi WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (millis() - start > 15000) {
+      Serial.println("\nQua lau, thu ket noi lai...");
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      start = millis();
+    }
+  }
+  Serial.print("\nDa ket noi. IP ESP32: ");
+  Serial.println(WiFi.localIP());
+}
+
+// Bat/tat coi (tu xu ly coi kich hoat muc cao hay muc thap)
+void buzzer(bool on) {
+  digitalWrite(BUZZER_PIN, (on == (bool)BUZZER_ACTIVE_HIGH) ? HIGH : LOW);
+}
+
+// Nhay LED: so lan, thoi gian sang (ms), thoi gian tat (ms); sound = true thi coi keu cung nhip
+void blinkLed(int times, int onMs, int offMs, bool sound) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    if (sound) buzzer(true);
+    delay(onMs);
+    digitalWrite(LED_PIN, LOW);
+    buzzer(false);
+    delay(offMs);
+  }
+}
+
+// 1 = hop le (LED sang lien tuc + 1 tieng bip), 0 = khong hop le (nhay 4 lan + bip 4 lan),
+// -1 = loi (nhay rat nhanh, coi im)
+void showResult(int result) {
+  if (result == 1) {
+    digitalWrite(LED_PIN, HIGH);
+    buzzer(true);
+    delay(200);                 // 1 tieng bip ngan
+    buzzer(false);
+    delay(RESULT_SHOW_MS - 200);
+    digitalWrite(LED_PIN, LOW);
+  } else if (result == 0) {
+    blinkLed(4, 250, 250, true);
+  } else {
+    blinkLed(8, 70, 70, false);
+  }
+}
+
+// Tra ve: 1 = hop le, 0 = khong hop le, -1 = loi
+int captureAndSend() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (USE_FLASH) {
+    digitalWrite(FLASH_PIN, HIGH);
+    delay(150);
+  }
+
+  // Bo 1 khung hinh cu trong bo dem de lay anh moi nhat
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (fb) esp_camera_fb_return(fb);
+
+  fb = esp_camera_fb_get();
+  if (USE_FLASH) digitalWrite(FLASH_PIN, LOW);
+
+  if (!fb) {
+    Serial.println("Chup anh that bai");
+    return -1;
+  }
+  Serial.printf("Da chup anh: %u bytes\n", fb->len);
+
+  HTTPClient http;
+  http.begin(SERVER_URL);
+  http.setTimeout(8000);
+  http.addHeader("Content-Type", "image/jpeg");
+  int code = http.POST(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+
+  int result = -1;
+  if (code == 200) {
+    String body = http.getString();
+    body.replace(" ", "");
+    body.replace("\n", "");
+    Serial.println("Server tra ve: " + body);
+    result = (body.indexOf("\"valid\":true") >= 0) ? 1 : 0;
+  } else {
+    Serial.printf("Loi gui anh: %d (%s)\n", code, http.errorToString(code).c_str());
+  }
+  http.end();
+  return result;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIR_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(FLASH_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  buzzer(false);
+  digitalWrite(FLASH_PIN, LOW);
+
+  if (!initCamera()) {
+    Serial.println("Kiem tra lai nguon 5V va day camera, roi reset.");
+    while (true) {
+      blinkLed(1, 300, 300, false);   // nhay cham de bao loi camera
+    }
+  }
+  connectWiFi();
+
+  Serial.println("Cho PIR on dinh 30 giay...");
+  digitalWrite(LED_PIN, HIGH);   // LED sang trong luc cho PIR
+  delay(PIR_WARMUP_MS);
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("San sang. Gui ky tu 'c' qua Serial de chup thu cong.");
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+
+  bool pirTriggered = (digitalRead(PIR_PIN) == HIGH);
+  bool manual = false;
+
+  // Chup thu cong bang Serial Monitor (dung khi PIR chap chon)
+  if (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == 'c') manual = true;
+  }
+
+  if ((pirTriggered || manual) && (millis() - lastShot > COOLDOWN_MS)) {
+    Serial.println(pirTriggered ? "PIR kich hoat" : "Chup thu cong");
+    int result = captureAndSend();
+    showResult(result);
+    lastShot = millis();
+  }
+  delay(50);
+}
